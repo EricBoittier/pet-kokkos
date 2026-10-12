@@ -22,6 +22,8 @@ void linear_bwd(View2D in_adj, View2D out_adj, const WeightRef& W, Net beta) {
 }
 
 void linear_silu(View2D out, View2D pre, View2D in, const WeightRef& W, View1D b) {
+  // The fused kernels are fp32 SIMT: only the native mode takes them.
+  if (!W.split && gemm_mode() == GemmMode::Native && silu_in_fused(out, pre, in, W.v, b)) return;
   linear(out, in, W, b);
   const int n = out.extent(0) * out.extent(1);
   const bool save = pre.data() != nullptr;
@@ -44,17 +46,17 @@ void silu_bwd(View2D grad, View2D pre) {
       });
 }
 
+void linear_silu_bwd(View2D grad, View2D out_adj, const WeightRef& W, View2D pre) {
+  if (!W.split && gemm_mode() == GemmMode::Native && silu_bwd_fused(grad, out_adj, W.v, pre)) return;
+  linear_bwd(grad, out_adj, W, 0);
+  silu_bwd(grad, pre);
+}
+
 void gather(View2D out, View2D table, IView1D idx) {
   const int D = out.extent(1);
   Kokkos::parallel_for(
       "gather", RangePolicy(0, out.extent(0) * D),
       KOKKOS_LAMBDA(int i) { out(i / D, i % D) = table(idx(i / D), i % D); });
-}
-
-void add_inplace(View2D a, View2D b) {
-  const int n = a.extent(0) * a.extent(1);
-  View1D a1(a.data(), n), b1(b.data(), n);
-  Kokkos::parallel_for("add", RangePolicy(0, n), KOKKOS_LAMBDA(int i) { a1(i) += b1(i); });
 }
 
 void copy(View2D a, View2D b) {
@@ -69,29 +71,49 @@ void copy(View2D a, View2D b) {
 // where LayerNorm centres (mu = mean) and RMSNorm does not (mu = 0). One warp per
 // row, in the network type (as torch does), and in two passes so LayerNorm's
 // variance never subtracts two large squares; the second pass reads from L1.
+// A block holds several rows: one 32-thread block per row would leave the GPU at
+// its limit of resident blocks with half its warp slots empty.
 
 constexpr double kRmsNormEps = 1.1920928955078125e-07;  // float32 epsilon
 constexpr double kLayerNormEps = 1e-5;
 
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+constexpr int kNormRows = 256 / kLanes;
+#else
+constexpr int kNormRows = 1;
+#endif
+
+TeamPolicy norm_policy(int rows) { return TeamPolicy((rows + kNormRows - 1) / kNormRows, kNormRows, kLanes); }
+
+KOKKOS_INLINE_FUNCTION Net norm_inv(Net sq, int D, bool ln) {
+  return Net(1) / Kokkos::sqrt(sq / D + Net(ln ? kLayerNormEps : kRmsNormEps));
+}
+
+KOKKOS_INLINE_FUNCTION Net row_mean(const Team& t, const View2D& x, int r) {
+  Net s = Net(0);
+  Kokkos::parallel_reduce(Kokkos::ThreadVectorRange(t, int(x.extent(1))), [&](int d, Net& a) { a += x(r, d); }, s);
+  return s / x.extent(1);
+}
+
 KOKKOS_INLINE_FUNCTION void row_stats(const Team& t, const View2D& x, int r, bool ln, Net& mu,
                                       Net& inv) {
   const int D = x.extent(1);
-  mu = Net(0);
-  if (ln) {
-    Kokkos::parallel_reduce(Kokkos::ThreadVectorRange(t, D), [&](int d, Net& s) { s += x(r, d); }, mu);
-    mu /= D;
-  }
+  mu = ln ? row_mean(t, x, r) : Net(0);
   Net v = Net(0);
   Kokkos::parallel_reduce(
       Kokkos::ThreadVectorRange(t, D), [&](int d, Net& s) { s += (x(r, d) - mu) * (x(r, d) - mu); }, v);
-  inv = Net(1) / Kokkos::sqrt(v / D + Net(ln ? kLayerNormEps : kRmsNormEps));
+  inv = norm_inv(v, D, ln);
 }
 
-void norm_fwd(View2D out, View2D in, View1D weight, View1D bias) {
-  const bool ln = bias.extent(0) > 0;
+void norm_fwd(View2D out, View2D in, View1D weight, View1D bias, View2D add) {
+  const bool ln = bias.extent(0) > 0, sum = add.data() != nullptr;
+  const int N = in.extent(0);
   Kokkos::parallel_for(
-      "norm", TeamPolicy(in.extent(0), 1, kLanes), KOKKOS_LAMBDA(const Team& t) {
-        const int r = t.league_rank();
+      "norm", norm_policy(N), KOKKOS_LAMBDA(const Team& t) {
+        const int r = t.league_rank() * kNormRows + t.team_rank();
+        if (r >= N) return;
+        // Each lane rereads only what it wrote, so the passes need no barrier.
+        if (sum) Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, in.extent(1)), [&](int d) { in(r, d) += add(r, d); });
         Net mu, inv;
         row_stats(t, in, r, ln, mu, inv);
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, in.extent(1)), [&](int d) {
@@ -102,26 +124,33 @@ void norm_fwd(View2D out, View2D in, View1D weight, View1D bias) {
 
 // With xhat = (x - mu) * inv and gw = out_adj * weight:
 //   in_adj = inv * (gw - [mean(gw) for LayerNorm] - xhat * mean(gw * xhat)).
-// The bias is a shift, so it does not appear.
-void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln, bool acc) {
-  const int D = in.extent(1);
+// The bias is a shift, so it does not appear. The variance and both gradient
+// sums come from one pass over the row (after the mean, for LayerNorm).
+void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln, bool acc, View2D also) {
+  const bool twice = also.data() != nullptr;
+  const int N = in.extent(0), D = in.extent(1);
   Kokkos::parallel_for(
-      "norm_bwd", TeamPolicy(in.extent(0), 1, kLanes), KOKKOS_LAMBDA(const Team& t) {
-        const int r = t.league_rank();
-        Net mu, inv, sg = Net(0), sgx = Net(0);
-        row_stats(t, in, r, ln, mu, inv);
+      "norm_bwd", norm_policy(N), KOKKOS_LAMBDA(const Team& t) {
+        const int r = t.league_rank() * kNormRows + t.team_rank();
+        if (r >= N) return;
+        const Net mu = ln ? row_mean(t, in, r) : Net(0);
+        Net sq = Net(0), sg = Net(0), sgx = Net(0);
         Kokkos::parallel_reduce(
             Kokkos::ThreadVectorRange(t, D),
-            [&](int d, Net& a, Net& b) {
-              const Net gw = out_adj(r, d) * weight(d);
-              a += gw;
-              b += gw * (in(r, d) - mu) * inv;
+            [&](int d, Net& a, Net& b, Net& c) {
+              const Net x = in(r, d) - mu, gw = out_adj(r, d) * weight(d);
+              a += x * x;
+              b += gw;
+              c += gw * x;
             },
-            sg, sgx);
-        const Net mg = ln ? sg / D : Net(0), mgx = sgx / D;
+            sq, sg, sgx);
+        const Net inv = norm_inv(sq, D, ln);
+        const Net mg = ln ? sg / D : Net(0), mgx = sgx * inv / D;
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, D), [&](int d) {
-          in_adj(r, d) = (acc ? in_adj(r, d) : Net(0)) +
-                         inv * (out_adj(r, d) * weight(d) - mg - (in(r, d) - mu) * inv * mgx);
+          const Net v = (acc ? in_adj(r, d) : Net(0)) +
+                        inv * (out_adj(r, d) * weight(d) - mg - (in(r, d) - mu) * inv * mgx);
+          in_adj(r, d) = v;
+          if (twice) also(r, d) = v;
         });
       });
 }

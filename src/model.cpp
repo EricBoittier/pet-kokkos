@@ -468,13 +468,14 @@ View2D PetModel::conditioning(const DeviceEdgeData& dev) {
   return out;
 }
 
-void PetModel::norm(View2D out, View2D in, const std::string& key) const {
+void PetModel::norm(View2D out, View2D in, const std::string& key, View2D add) const {
   const bool ln = h_.normalization == Normalization::LayerNorm;
-  norm_fwd(out, in, vec(key + ".weight"), ln ? vec(key + ".bias") : View1D());
+  norm_fwd(out, in, vec(key + ".weight"), ln ? vec(key + ".bias") : View1D(), add);
 }
 
-void PetModel::norm_bwd(View2D in_adj, View2D out_adj, View2D in, const std::string& key, bool acc) const {
-  pet::norm_bwd(in_adj, out_adj, in, vec(key + ".weight"), h_.normalization == Normalization::LayerNorm, acc);
+void PetModel::norm_bwd(View2D in_adj, View2D out_adj, View2D in, const std::string& key, bool acc,
+                        View2D also) const {
+  pet::norm_bwd(in_adj, out_adj, in, vec(key + ".weight"), h_.normalization == Normalization::LayerNorm, acc, also);
 }
 
 int PetModel::ffn_pre_width(const std::string& key) const { return mat(key + ".w_in.weight").extent(0); }
@@ -494,8 +495,7 @@ void PetModel::feedforward_bwd(View2D in_adj, View2D out_adj, const std::string&
   if (h_.activation == Activation::SwiGLU) return swiglu_bwd(ws_, in_adj, out_adj, pre, w_in, w_out, beta);
   Workspace::Scope scope(ws_);
   View2D h_adj = ws_.tmp(out_adj.extent(0), pre.extent(1));
-  linear_bwd(h_adj, out_adj, w_out, 0);
-  silu_bwd(h_adj, pre);
+  linear_silu_bwd(h_adj, out_adj, w_out, pre);
   linear_bwd(in_adj, h_adj, w_in, beta);
 }
 
@@ -559,16 +559,12 @@ void PetModel::readout_bwd(const ReadoutSaves& sav, int i, const PackedEdges& pk
         cutoff_adj(k) = acc ? cutoff_adj(k) + ep : ep;
       });
   View2D nh1_adj = ws_.n2("ro:nh1_adj", N, Dh), nh0_adj = ws_.n2("ro:nh0_adj", N, Dh);
-  linear_bwd(nh1_adj, npa, mat("node_last_layers.energy." + si + ".energy___0.weight"), 0);
-  silu_bwd(nh1_adj, sav.nh1[i]);
-  linear_bwd(nh0_adj, nh1_adj, mat("node_heads.energy." + si + ".2.weight"), 0);
-  silu_bwd(nh0_adj, sav.nh0[i]);
+  linear_silu_bwd(nh1_adj, npa, mat("node_last_layers.energy." + si + ".energy___0.weight"), sav.nh1[i]);
+  linear_silu_bwd(nh0_adj, nh1_adj, mat("node_heads.energy." + si + ".2.weight"), sav.nh0[i]);
   linear_bwd(node_adj, nh0_adj, mat("node_heads.energy." + si + ".0.weight"), 0);
   View2D eh1_adj = ws_.n2("ro:eh1_adj", E, Dh), eh0_adj = ws_.n2("ro:eh0_adj", E, Dh);
-  linear_bwd(eh1_adj, epa, mat("edge_last_layers.energy." + si + ".energy___0.weight"), 0);
-  silu_bwd(eh1_adj, sav.eh1[i]);
-  linear_bwd(eh0_adj, eh1_adj, mat("edge_heads.energy." + si + ".2.weight"), 0);
-  silu_bwd(eh0_adj, sav.eh0[i]);
+  linear_silu_bwd(eh1_adj, epa, mat("edge_last_layers.energy." + si + ".energy___0.weight"), sav.eh1[i]);
+  linear_silu_bwd(eh0_adj, eh1_adj, mat("edge_heads.energy." + si + ".2.weight"), sav.eh0[i]);
   linear_bwd(edge_adj, eh0_adj, mat("edge_heads.energy." + si + ".0.weight"), 0);
 }
 
@@ -608,17 +604,22 @@ Recompute PetModel::recompute_tier(int N, int S, int E) const {
   // set every tier needs.
   const std::size_t G = h_.num_gnn_layers, A = h_.num_attention_layers, D = h_.d_pet, Dh = h_.d_head;
   const std::size_t NS = std::size_t(N) * S, NE = E, ew = ffn_pre_width("gnn_layers.0.trans.layers.0.mlp");
-  const std::size_t layer = sizeof(Net) * (A * (NS * 5 * D + NE * (ew + D)) + NE * 5 * D);
-  const std::size_t wide = sizeof(Net) * A * (NS * 3 * D + NE * ew);
-  const std::size_t work = sizeof(Net) * NE * (2 * ew + 6 * D + 4 * Dh);
+  const bool res = h_.featurizer_type == FeaturizerType::Residual;
+  // Residual, per block: qkv, the MLP pre-activation, s1, s2 and the attention's
+  // merged heads; wide trades qkv and pre for the block's input tokens.
+  const std::size_t layer = sizeof(Net) * (res ? A * NS * (6 * D + ew) + NE * D
+                                               : A * (NS * 5 * D + NE * (ew + D)) + NE * 5 * D);
+  const std::size_t wide = sizeof(Net) * (res ? A * NS * (2 * D + ew) : A * (NS * 3 * D + NE * ew));
+  const std::size_t work = sizeof(Net) * (res ? NS * (9 * D + 2 * ew) + NE * (6 * D + 4 * Dh)
+                                              : NE * (2 * ew + 6 * D + 4 * Dh));
   // Layers keeps each layer's inputs and one layer's saves at a time. The pool
   // comes out a quarter to a third above these terms (readout saves, packing,
   // the tmp pool's slack; measured on pet-mad-xs and -s), so they are scaled to
   // predict it.
-  const std::size_t inputs = sizeof(Net) * G * (std::size_t(N) * h_.d_node + NE * D);
+  const std::size_t inputs = sizeof(Net) * G * ((res ? 0 : std::size_t(N) * h_.d_node) + NE * D);
   auto need = [&](Recompute r) {
     const std::size_t terms =
-        work + (r == Recompute::Never ? G * layer : r == Recompute::Wide ? G * (layer - wide) : inputs + layer);
+        work + (r == Recompute::Never ? G * layer : r == Recompute::Wide ? G * (layer - wide) : inputs + layer - wide);
     return terms + terms / 3;
   };
   auto fits = [&](Recompute r) { return mem_budget_ == 0 || need(r) <= mem_budget_; };

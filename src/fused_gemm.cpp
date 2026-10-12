@@ -154,7 +154,61 @@ struct SwigluBwd {
   }
 };
 
+// p = acc + b; out = silu(p), and pre = p when kept.
+struct SiluFwd {
+  float *out, *pre;
+  const float* b;
+  int N;
+  __device__ void operator()(int r, int c, const float* v) const {
+    F4 p = {v[0], v[1], v[2], v[3]};
+    if (b) {
+      const F4 bb = *reinterpret_cast<const F4*>(b + c);
+      p = {p.x + bb.x, p.y + bb.y, p.z + bb.z, p.w + bb.w};
+    }
+    const std::size_t o = std::size_t(r) * N + c;
+    if (pre) at4(pre, o) = p;
+    at4(out, o) = {p.x * sigmoid(p.x), p.y * sigmoid(p.y), p.z * sigmoid(p.z), p.w * sigmoid(p.w)};
+  }
+};
+
+// acc = the adjoint of silu's output; grad = acc * silu'(pre).
+struct SiluBwd {
+  const float* pre;
+  float* grad;
+  int N;
+  __device__ void operator()(int r, int c, const float* a) const {
+    const std::size_t o = std::size_t(r) * N + c;
+    const F4 p = at4(const_cast<float*>(pre), o);
+    const float x[4] = {p.x, p.y, p.z, p.w};
+    float g[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float sg = sigmoid(x[j]);
+      g[j] = a[j] * sg * (1.0f + x[j] * (1.0f - sg));
+    }
+    at4(grad, o) = {g[0], g[1], g[2], g[3]};
+  }
+};
+
 }  // namespace
+
+bool silu_in_fused(View2D out, View2D pre, View2D in, const View2D& w, View1D b) {
+  if (!enabled() || !big_enough(out.extent(0), out.extent(1)) || !vec_ok(out) || (pre.data() && !vec_ok(pre)) ||
+      (b.data() && !vec_ok(b)) || !in.span_is_contiguous())
+    return false;
+  launch<CM>("fused linear_silu", out.extent(0), out.extent(1), in.extent(1), in.data(), w.data(),
+             SiluFwd{out.data(), pre.data(), b.data(), int(out.extent(1))});
+  return true;
+}
+
+bool silu_bwd_fused(View2D grad, View2D out_adj, const View2D& w, View2D pre) {
+  if (!enabled() || !big_enough(grad.extent(0), grad.extent(1)) || !vec_ok(grad) || !vec_ok(pre) ||
+      !out_adj.span_is_contiguous())
+    return false;
+  launch<RM>("fused silu_bwd", grad.extent(0), grad.extent(1), out_adj.extent(1), out_adj.data(), w.data(),
+             SiluBwd{pre.data(), grad.data(), int(grad.extent(1))});
+  return true;
+}
 
 bool swiglu_in_fused(View2D pre, View2D h, View2D in, const View2D& w, View1D b) {
   if (!enabled() || !big_enough(pre.extent(0), pre.extent(1)) || !vec_ok(pre) || (h.data() && !vec_ok(h)) || !vec_ok(b) || !in.span_is_contiguous()) return false;
@@ -174,6 +228,8 @@ bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2
 
 #else
 
+bool silu_in_fused(View2D, View2D, View2D, const View2D&, View1D) { return false; }
+bool silu_bwd_fused(View2D, View2D, const View2D&, View2D) { return false; }
 bool swiglu_in_fused(View2D, View2D, View2D, const View2D&, View1D) { return false; }
 bool swiglu_bwd_fused(View2D, View2D, const View2D&, View2D) { return false; }
 

@@ -182,6 +182,16 @@ struct LayerSaves {
   std::vector<View2D> tokens, qkv, node_new, tmp_center, eps, tmp_edge;
 };
 
+// What one GNN layer of the residual featurizer saves for its backward, per
+// block: the residual sums s1 and s2 its norms read, and either the widest
+// activations (attention qkv, the MLP's pre-activation) or, when those are
+// rebuilt, the block's input tokens. Workspace keys carry `tag`.
+struct ResidualSaves {
+  std::string tag;
+  View2D cpre;
+  std::vector<View2D> qkv, pre, tin, s1, s2;
+};
+
 // What the readout saves for its backward, one entry per readout layer.
 struct ReadoutSaves {
   std::vector<View2D> nh0, nh1, eh0, eh1, epred;
@@ -267,6 +277,10 @@ class PetModel {
   void ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, int L, const LayerSaves& sav,
                     bool kept_wide, View2D node_adj, View2D input_edge_adj, View2D x4_adj,
                     View2D cf_seq_adj);
+  // One residual GNN layer from input_edge to its read-out features; sav null
+  // saves nothing, save_wide keeps qkv and the MLP pre-activation.
+  void residual_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D input_edge,
+                      View2D node_out, View2D edge_out, ResidualSaves* sav, bool save_wide);
   PackedEdges pack_edges(const DeviceEdgeData& dev);
   View2D conditioning(const DeviceEdgeData& dev);
   void readout_bwd(const ReadoutSaves& sav, int i, const PackedEdges& pk, int N, View2D node_adj,
@@ -279,8 +293,9 @@ class PetModel {
 
   // The pieces the two featurizers share but configure differently (which norm,
   // which activation), dispatched on the hypers.
-  void norm(View2D out, View2D in, const std::string& key) const;
-  void norm_bwd(View2D in_adj, View2D out_adj, View2D in, const std::string& key, bool acc = true) const;
+  void norm(View2D out, View2D in, const std::string& key, View2D add = {}) const;
+  void norm_bwd(View2D in_adj, View2D out_adj, View2D in, const std::string& key, bool acc = true,
+                View2D also = {}) const;
   // out = w_out(act(w_in(in))) onto beta * out; `pre` receives w_in(in), [R,
   // ffn_pre_width] (2*dff for SwiGLU's value|gate pair, dff for SiLU).
   void feedforward(View2D out, View2D in, const std::string& key, View2D pre, bool save, Net beta = 0);

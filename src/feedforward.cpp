@@ -169,8 +169,7 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
   {
     Workspace::Scope scope(ws_);
     View2D cph_adj = ws_.tmp(E, 2 * D), cnorm_adj = ws_.tmp(E, 2 * D), concat_adj = ws_.tmp(E, 2 * D);
-    linear_bwd(cph_adj, input_edge_adj, mat("combination_mlps." + ls + ".2.weight"), 0);
-    silu_bwd(cph_adj, sav.cph);
+    linear_silu_bwd(cph_adj, input_edge_adj, mat("combination_mlps." + ls + ".2.weight"), sav.cph);
     linear_bwd(cnorm_adj, cph_adj, mat("combination_mlps." + ls + ".0.weight"), 0);
     pet::norm_bwd(concat_adj, cnorm_adj, sav.concat, vec("combination_norms." + ls + ".weight"), true, false);
     // An edge to a ghost: its partner's rank has the adjoint of this edge's row,

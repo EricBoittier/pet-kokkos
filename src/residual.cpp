@@ -12,6 +12,66 @@
 
 namespace pet {
 
+void PetModel::residual_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D input_edge,
+                              View2D node_out, View2D edge_out, ResidualSaves* sav, bool save_wide) {
+  const int N = dev.n_atoms, S = dev.max_neighbors + 1, E = pk.E;
+  const int D = h_.d_pet, A = h_.num_attention_layers;
+  auto off = pk.off;
+  const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
+  const bool save = sav != nullptr, wide = save && save_wide;
+  if (save) sav->qkv.assign(A, View2D()), sav->pre = sav->tin = sav->s1 = sav->s2 = sav->qkv;
+  auto keep = [&](const std::string& name, int a, int r, int c) {
+    return ws_.n2("rs_" + name + "_" + sav->tag + "_" + std::to_string(a), r, c);
+  };
+
+  View2D node_L = ws_.n2("re_node_L", N, D);
+  gather(node_L, mat("node_embedders." + ls + ".weight").v, dev.species);
+  View2D cpre = ws_.n2("re_cpre", E, D), et = ws_.n2("re_et", E, D);
+  if (save) sav->cpre = ws_.n2("rs_cpre_" + sav->tag, E, D);
+  compress_fwd(cpre, save ? sav->cpre : View2D(), compress_fold(L), input_edge, pk);
+  linear(et, cpre, mat(g + ".compress.2.weight"), vec(g + ".compress.2.bias"));
+
+  View2D tokens = ws_.n2("re_tokens", N * S, D);
+  Kokkos::parallel_for(
+      "re_tok", RangePolicy(0, N * S * D), KOKKOS_LAMBDA(int i) {
+        const int row = i / D, d = i % D, n = row / S, k = off(n) + row % S - 1;
+        tokens(row, d) = row % S == 0 ? node_L(n, d) : k < off(n + 1) ? et(k, d) : Net(0);
+      });
+
+  // PostLN: tokens = norm(tokens + attention(tokens)), then norm(t + mlp(t)).
+  for (int a = 0; a < A; ++a) {
+    const std::string tl = g + ".trans.layers." + std::to_string(a);
+    const std::string key = "re_attn_" + (save ? sav->tag : ls) + "_" + std::to_string(a);
+    const int pw = ffn_pre_width(tl + ".mlp");
+    if (save && !wide) copy(sav->tin[a] = keep("tin", a, N * S, D), tokens);
+    View2D s1 = save ? (sav->s1[a] = keep("s1", a, N * S, D)) : ws_.n2("re_attn_out", N * S, D);
+    View2D s2 = save ? (sav->s2[a] = keep("s2", a, N * S, D)) : ws_.n2("re_ff", N * S, D);
+    {
+      Workspace::Scope scope(ws_);
+      View2D qkv = wide ? (sav->qkv[a] = keep("qkv", a, N * S, 3 * D)) : ws_.tmp(N * S, 3 * D);
+      linear(qkv, tokens, mat(tl + ".attention.input_linear.weight"), vec(tl + ".attention.input_linear.bias"));
+      attention(ws_, key, s1, qkv, dev.cf_seq, mat(tl + ".attention.output_linear.weight"),
+                vec(tl + ".attention.output_linear.bias"), N, S, h_.num_heads, h_.head_dim,
+                h_.attention_temperature, save);
+    }
+    View2D tok_a = ws_.n2("re_tok_a", N * S, D);
+    norm(tok_a, s1, tl + ".norm_attention", tokens);  // s1 += tokens first
+    {
+      Workspace::Scope scope(ws_);
+      View2D pre = wide ? (sav->pre[a] = keep("pre", a, N * S, pw)) : ws_.tmp(N * S, pw);
+      feedforward(s2, tok_a, tl + ".mlp", pre, wide);
+    }
+    norm(tokens, s2, tl + ".norm_mlp", tok_a);  // s2 += tok_a first
+  }
+
+  Kokkos::parallel_for(
+      "re_split", RangePolicy(0, N * S * D), KOKKOS_LAMBDA(int i) {
+        const int row = i / D, d = i % D, n = row / S, k = off(n) + row % S - 1;
+        if (row % S == 0) node_out(n, d) = tokens(row, d);
+        else if (k < off(n + 1)) edge_out(k, d) = tokens(row, d);
+      });
+}
+
 DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   if (dev.exchange)
     throw std::runtime_error("pet: the residual featurizer does not run over several ranks (exchange) yet");
@@ -27,60 +87,22 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   View2D input_edge = ws_.n2("re_input_edge", E, D);
   gather(input_edge, mat("edge_embedder.weight").v, pk.species);
 
-  // Saved for the backward, per layer and per block.
-  std::vector<View2D> node_feat(G), edge_feat(G), sav_cpre(G);
-  std::vector<std::vector<View2D>> sav_qkv(G, std::vector<View2D>(A)), sav_s1 = sav_qkv, sav_s2 = sav_qkv,
-                                   sav_pre = sav_qkv;
-  auto saved = [&](const std::string& name, int L, int a, int r, int c) {
-    return ws_.n2("rs_" + name + "_" + std::to_string(L) + "_" + std::to_string(a), r, c);
-  };
+  // What the backward will have: every layer's saves; the same with each block's
+  // input tokens in place of the two widest (rebuilt when needed); or only each
+  // layer's input_edge, the backward then re-running one layer at a time.
+  const Recompute rc = recompute_tier(N, S, E);
+  const bool keep_wide = rc == Recompute::Never, ckpt = grad && rc == Recompute::Layers;
+  std::vector<ResidualSaves> sav(grad && !ckpt ? G : 0);
+  std::vector<View2D> inputs(ckpt ? G : 0);
+  std::vector<View2D> node_feat(G), edge_feat(G);
 
   for (int L = 0; L < G; ++L) {
-    const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
-    View2D node_L = ws_.n2("re_node_L", N, D);
-    gather(node_L, mat("node_embedders." + ls + ".weight").v, dev.species);
-    View2D cpre = ws_.n2("re_cpre", E, D), et = ws_.n2("re_et", E, D);
-    if (grad) sav_cpre[L] = ws_.n2("rs_cpre_" + ls, E, D);
-    compress_fwd(cpre, sav_cpre[L], compress_fold(L), input_edge, pk);
-    linear(et, cpre, mat(g + ".compress.2.weight"), vec(g + ".compress.2.bias"));
-
-    View2D tokens = ws_.n2("re_tokens", N * S, D);
-    Kokkos::parallel_for(
-        "re_tok", RangePolicy(0, N * S * D), KOKKOS_LAMBDA(int i) {
-          const int row = i / D, d = i % D, n = row / S, k = off(n) + row % S - 1;
-          tokens(row, d) = row % S == 0 ? node_L(n, d) : k < off(n + 1) ? et(k, d) : Net(0);
-        });
-
-    // PostLN: tokens = norm(tokens + attention(tokens)), then norm(t + mlp(t)).
-    for (int a = 0; a < A; ++a) {
-      const std::string tl = g + ".trans.layers." + std::to_string(a);
-      const std::string key = "re_attn_" + ls + "_" + std::to_string(a);
-      const int pw = ffn_pre_width(tl + ".mlp");
-      Workspace::Scope block_scope(ws_);
-      View2D qkv = grad ? (sav_qkv[L][a] = saved("qkv", L, a, N * S, 3 * D)) : ws_.n2("re_qkv", N * S, 3 * D);
-      View2D s1 = grad ? (sav_s1[L][a] = saved("s1", L, a, N * S, D)) : ws_.n2("re_attn_out", N * S, D);
-      View2D s2 = grad ? (sav_s2[L][a] = saved("s2", L, a, N * S, D)) : ws_.n2("re_ff", N * S, D);
-      sav_pre[L][a] = grad ? saved("pre", L, a, N * S, pw) : ws_.tmp(N * S, pw);
-      linear(qkv, tokens, mat(tl + ".attention.input_linear.weight"), vec(tl + ".attention.input_linear.bias"));
-      attention(ws_, key, s1, qkv, dev.cf_seq, mat(tl + ".attention.output_linear.weight"),
-                vec(tl + ".attention.output_linear.bias"), N, S, h_.num_heads, h_.head_dim,
-                h_.attention_temperature, grad);
-      add_inplace(s1, tokens);
-      View2D tok_a = ws_.n2("re_tok_a", N * S, D);
-      norm(tok_a, s1, tl + ".norm_attention");
-      feedforward(s2, tok_a, tl + ".mlp", sav_pre[L][a], grad);
-      add_inplace(s2, tok_a);
-      norm(tokens, s2, tl + ".norm_mlp");
-    }
-
+    const std::string ls = std::to_string(L);
+    if (ckpt) copy(inputs[L] = ws_.n2("rck_ie_" + ls, E, D), input_edge);
+    if (!sav.empty()) sav[L].tag = ls;
     View2D node_out = node_feat[L] = ws_.n2("re_nfeat_" + ls, N, D);
     View2D edge_out = edge_feat[L] = ws_.n2("re_efeat_" + ls, E, D);
-    Kokkos::parallel_for(
-        "re_split", RangePolicy(0, N * S * D), KOKKOS_LAMBDA(int i) {
-          const int row = i / D, d = i % D, n = row / S, k = off(n) + row % S - 1;
-          if (row % S == 0) node_out(n, d) = tokens(row, d);
-          else if (k < off(n + 1)) edge_out(k, d) = tokens(row, d);
-        });
+    residual_layer(dev, pk, L, input_edge, node_out, edge_out, sav.empty() ? nullptr : &sav[L], keep_wide);
     if (cond.extent(0) == (std::size_t) N)
       Kokkos::parallel_for(
           "re_cond_add", RangePolicy(0, N * D), KOKKOS_LAMBDA(int i) { node_out(i / D, i % D) += cond(i / D, i % D); });
@@ -114,10 +136,28 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   }
   for (int i = 0; i < R; ++i) readout_bwd(rs, i, pk, N, node_adj[i], edge_adj[i], cutoff_adj, i > 0);
 
+  // A rebuilt activation: lin(x), x = norm(in) when norm_key is given.
+  auto rebuild = [&](View2D in, const std::string& norm_key, const std::string& lin) {
+    View2D x = in;
+    if (!norm_key.empty()) norm(x = ws_.n2("re_tok_a", in.extent(0), in.extent(1)), in, norm_key);  // free by now
+    View2D out = ws_.tmp(in.extent(0), mat(lin + ".weight").extent(0));
+    if (h_.activation == Activation::SwiGLU && norm_key.size()) swiglu_in(out, {}, x, mat(lin + ".weight"), vec(lin + ".bias"));
+    else linear(out, x, mat(lin + ".weight"), vec(lin + ".bias"));
+    return out;
+  };
+
   // ie_adj: the adjoint of the next layer's input_edge (zero past the last).
   View2D ie_adj = ws_.n2("re_ie_adj", E, D);
   for (int L = G - 1; L >= 0; --L) {
     const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
+    Workspace::Scope layer_scope(ws_);
+    ResidualSaves one;
+    if (ckpt) {
+      one.tag = "r";  // one shared set of saves
+      residual_layer(dev, pk, L, inputs[L], ws_.n2("re_nfeat_r", N, D), ws_.n2("re_efeat_r", E, D), &one, false);
+    }
+    const ResidualSaves& s = ckpt ? one : sav[L];
+    const bool kept_wide = keep_wide && !ckpt;
     auto efa = edge_adj[L], nfa = node_adj[L];
     if (L + 1 < G)  // message passing: half of the next input's adjoint, via the reverse edge
       Kokkos::parallel_for(
@@ -134,19 +174,26 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
 
     for (int a = A - 1; a >= 0; --a) {
       const std::string tl = g + ".trans.layers." + std::to_string(a);
-      const std::string key = "re_attn_" + ls + "_" + std::to_string(a);
+      const std::string key = "re_attn_" + s.tag + "_" + std::to_string(a);
       // tokens_out = norm(s2), s2 = tok_a + mlp(tok_a)
       View2D s2_adj = ws_.n2("re_s2_adj", N * S, D), tok_a_adj = ws_.n2("re_tok_a_adj", N * S, D);
-      norm_bwd(s2_adj, tokens_adj, sav_s2[L][a], tl + ".norm_mlp", false);
-      copy(tok_a_adj, s2_adj);
-      feedforward_bwd(tok_a_adj, s2_adj, tl + ".mlp", sav_pre[L][a]);
+      norm_bwd(s2_adj, tokens_adj, s.s2[a], tl + ".norm_mlp", false, tok_a_adj);  // and a copy for the residual
+      {
+        Workspace::Scope scope(ws_);
+        feedforward_bwd(tok_a_adj, s2_adj, tl + ".mlp",
+                        kept_wide ? s.pre[a] : rebuild(s.s1[a], tl + ".norm_attention", tl + ".mlp.w_in"));
+      }
       // tok_a = norm(s1), s1 = tokens_in + attention(tokens_in): the attention's
       // share accumulates onto the residual's, which is then tokens_in's adjoint.
       View2D s1_adj = ws_.n2("re_s1_adj_" + std::to_string(a % 2), N * S, D);
-      norm_bwd(s1_adj, tok_a_adj, sav_s1[L][a], tl + ".norm_attention", false);
-      attention_bwd(ws_, key, s1_adj, cf_seq_adj, s1_adj, sav_qkv[L][a], dev.cf_seq,
-                    mat(tl + ".attention.input_linear.weight"), mat(tl + ".attention.output_linear.weight"),
-                    N, S, h_.num_heads, h_.head_dim, h_.attention_temperature, 1);
+      norm_bwd(s1_adj, tok_a_adj, s.s1[a], tl + ".norm_attention", false);
+      {
+        Workspace::Scope scope(ws_);
+        attention_bwd(ws_, key, s1_adj, cf_seq_adj, s1_adj,
+                      kept_wide ? s.qkv[a] : rebuild(s.tin[a], "", tl + ".attention.input_linear"), dev.cf_seq,
+                      mat(tl + ".attention.input_linear.weight"), mat(tl + ".attention.output_linear.weight"),
+                      N, S, h_.num_heads, h_.head_dim, h_.attention_temperature, 1);
+      }
       tokens_adj = s1_adj;
     }
 
@@ -163,7 +210,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
           ie_next(k, d) = has_msg ? Net(0.5) * ie_adj(k, d) : Net(0);
         });
     linear_bwd(cpre_adj, et_adj, mat(g + ".compress.2.weight"), 0);
-    compress_bwd(cpre_adj, sav_cpre[L], compress_fold(L), x4_adj, ie_next);
+    compress_bwd(cpre_adj, s.cpre, compress_fold(L), x4_adj, ie_next);
     ie_adj = ie_next;
   }
 

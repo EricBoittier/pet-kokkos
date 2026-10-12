@@ -26,17 +26,20 @@ void linear_bwd(View2D in_adj, View2D out_adj, const WeightRef& W, Net beta = 1)
 void linear_silu(View2D out, View2D pre, View2D in, const WeightRef& W, View1D b);
 // grad *= silu'(pre), in place.
 void silu_bwd(View2D grad, View2D pre);
+// grad = linear_bwd(out_adj through W), then silu_bwd by pre: the backward of
+// linear_silu's successor and its activation, in one pass where it can.
+void linear_silu_bwd(View2D grad, View2D out_adj, const WeightRef& W, View2D pre);
 
 // out(r, :) = table(idx(r), :).
 void gather(View2D out, View2D table, IView1D idx);
-// a += b, and a = b -- the latter a plain kernel, so it is always safe inside a
-// recorded CUDA graph.
-void add_inplace(View2D a, View2D b);
+// a = b, a plain kernel, so it is always safe inside a recorded CUDA graph.
 void copy(View2D a, View2D b);
 
 // RMSNorm, or LayerNorm when `bias` is non-empty (see ops.cpp).
-void norm_fwd(View2D out, View2D in, View1D weight, View1D bias);
-void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool layernorm, bool acc);
+// add, unless empty, is first added into in (a residual sum the norm reads);
+// also, unless empty, receives a second copy of in_adj.
+void norm_fwd(View2D out, View2D in, View1D weight, View1D bias, View2D add = {});
+void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool layernorm, bool acc, View2D also = {});
 
 // out = w_out(v * sigmoid(g)) onto beta * out, where pre = w_in(in) holds v and
 // g interleaved (v_j, g_j at 2j, 2j+1: w_in's rows are reordered at load so the
@@ -52,6 +55,8 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
 // The same with the GEMM and the elementwise step fused (fused_gemm.cpp), h
 // optional; false when that cannot run here.
 bool swiglu_in_fused(View2D pre, View2D h, View2D in, const View2D& w, View1D b);
+bool silu_in_fused(View2D out, View2D pre, View2D in, const View2D& w, View1D b);
+bool silu_bwd_fused(View2D grad, View2D out_adj, const View2D& w, View2D pre);
 bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2D pre);
 
 // out = silu(pre), pre = compress.0 of one GNN layer through its CompressFold.

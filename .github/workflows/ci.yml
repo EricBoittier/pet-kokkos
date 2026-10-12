@@ -29,7 +29,7 @@ jobs:
         run: |
           uv run tools/convert_pet.py --model pet-mad-xs --version 1.5.0 --out models/pet-mad-xs
           uv run tools/convert_pet.py --model pet-mad-xs --version 1.6.0 --out models/pet-mad-xs-v1.6
-          uv run tools/convert_pet.py --model pet-mols-s --version 1.0.0 --out models/pet-mols-s-v1.0
+          uv run tools/convert_pet.py --model pet-mols-s --version 1.1.0 --out models/pet-mols-s-v1.1
           uv run tools/convert_pet.py --model pet-omol-s --version 1.0.0 --out models/pet-omol-s
 
       - name: Cache dependencies

@@ -447,7 +447,6 @@ TEST_CASE("ranks that exchange messages reproduce the periodic evaluation", "[mo
     const Golden* g = found ? first_periodic(model, store) : nullptr;
     if (!g) continue;
     pet::Calculator calc(found->first, found->second);
-    if (calc.hypers().featurizer_type != pet::FeaturizerType::FeedForward) continue;
     DYNAMIC_SECTION(model) {
       const pet::System& s = g->system;
       const double rc = calc.cutoff();
@@ -473,7 +472,7 @@ TEST_CASE("ranks that exchange messages reproduce the periodic evaluation", "[mo
       x.mute = true;
       const pet::Results m = calc.compute_step(d.pos.data(), nullptr, true, false);
       INFO("without the edge rows, E " << m.energy[0]);
-      CHECK(std::fabs(m.energy[0] - ref.energy[0]) > 1e-3 * std::fabs(ref.energy[0]));
+      CHECK(std::fabs(m.energy[0] - ref.energy[0]) > 1e-4 * std::fabs(ref.energy[0]));  // 10x the agreement above
     }
   }
 }
@@ -572,7 +571,6 @@ TEST_CASE("a list set on the device gives what the same list set from the host d
     }
 
     DYNAMIC_SECTION(model << " / exchange") {
-      if (calc.hypers().featurizer_type != pet::FeaturizerType::FeedForward) continue;
       ImageExchange x(d);
       pet::EdgeListView hv = view(d);
       hv.exchange = &x;
@@ -650,7 +648,6 @@ TEST_CASE("an exchanging engine's recorded steps are its eager ones", "[model][e
       fixed.md_fixed_shapes = eager.md_fixed_shapes = true;
       eager.graphs = false;
       pet::Calculator a(found->first, found->second, fixed), b(found->first, found->second, eager);
-      if (a.hypers().featurizer_type != pet::FeaturizerType::FeedForward) continue;
       const pet::System& s = g->system;
       const double rc = a.cutoff();
       Domain d = make_domain(s, rc + 1.5, 0.0, rc + 1.5);  // room for the atoms to move

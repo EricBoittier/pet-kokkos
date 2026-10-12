@@ -8,13 +8,11 @@
 // for the next layer.
 #include "ops.hpp"
 
-#include <stdexcept>
-
 namespace pet {
 
 void PetModel::residual_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D input_edge,
                               View2D node_out, View2D edge_out, ResidualSaves* sav, bool save_wide) {
-  const int N = dev.n_atoms, S = dev.max_neighbors + 1, E = pk.E;
+  const int N = dev.centres(), S = dev.max_neighbors + 1, E = pk.E;
   const int D = h_.d_pet, A = h_.num_attention_layers;
   auto off = pk.off;
   const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
@@ -73,9 +71,7 @@ void PetModel::residual_layer(const DeviceEdgeData& dev, const PackedEdges& pk, 
 }
 
 DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
-  if (dev.exchange)
-    throw std::runtime_error("pet: the residual featurizer does not run over several ranks (exchange) yet");
-  const int N = dev.n_atoms, S = dev.max_neighbors + 1;
+  const int N = dev.centres(), S = dev.max_neighbors + 1;  // the model's rows
   const int D = h_.d_pet, G = h_.num_gnn_layers, A = h_.num_attention_layers, R = h_.num_readout_layers;
   Workspace::Scope scope(ws_);
   ws_.set_zero(false);
@@ -83,6 +79,23 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   const PackedEdges pk = pack_edges(dev);
   const int E = pk.E;
   auto off = pk.off, rev = pk.reverse, center = pk.center;
+  // Over several ranks, an edge to a ghost passes its message to and from the
+  // reverse edge on the ghost's own rank: its row among the live ones (ro), and
+  // each live row's packed edge (lp). The exchange is collective: every rank
+  // takes part in each one, rows or not.
+  const bool remote = dev.exchange != nullptr;
+  auto ro = pk.remote_of, lp = pk.live_packed;
+  // Rows of `of` for the live edges to ghosts, scaled; the partners' rows back.
+  auto swap_rows = [&](View2D of, Net scale) {
+    View2D out = ws_.tmp(pk.n_live, D), in = ws_.tmp(pk.n_live, D);
+    Kokkos::parallel_for(
+        "re_remote_rows", RangePolicy(0, pk.n_live * D), KOKKOS_LAMBDA(int i) {
+          const int k = lp(i / D);  // -1: a capacity's padding
+          out(i / D, i % D) = k >= 0 ? scale * of(k, i % D) : Net(0);
+        });
+    dev.exchange->edges(out, in);
+    return in;
+  };
   const View2D cond = conditioning(dev);
   View2D input_edge = ws_.n2("re_input_edge", E, D);
   gather(input_edge, mat("edge_embedder.weight").v, pk.species);
@@ -106,18 +119,22 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     if (cond.extent(0) == (std::size_t) N)
       Kokkos::parallel_for(
           "re_cond_add", RangePolicy(0, N * D), KOKKOS_LAMBDA(int i) { node_out(i / D, i % D) += cond(i / D, i % D); });
-    if (L + 1 < G)
+    if (L + 1 < G) {
+      Workspace::Scope msg_scope(ws_);
+      const View2D partner = remote ? swap_rows(edge_out, Net(1)) : View2D();
       Kokkos::parallel_for(
           "re_msg", RangePolicy(0, E * D), KOKKOS_LAMBDA(int i) {
-            const int k = i / D, d = i % D;
-            input_edge(k, d) = Net(0.5) * (input_edge(k, d) + (rev(k) >= 0 ? edge_out(rev(k), d) : Net(0)));
+            const int k = i / D, d = i % D, r = rev(k);
+            const Net back = r >= 0 ? edge_out(r, d) : remote && ro(k) >= 0 ? partner(ro(k), d) : Net(0);
+            input_edge(k, d) = Net(0.5) * (input_edge(k, d) + back);
           });
+    }
   }
 
   View1D net = ws_.n1("re_per_atom_net", N);
   ReadoutSaves rs;
   readout(node_feat, edge_feat, net, pk, grad ? &rs : nullptr, "re_");
-  RView1D per_atom = ws_.r1("re_per_atom", N);
+  RView1D per_atom = ws_.r1("re_per_atom", dev.n_atoms);  // every atom's, 0 past n_local
   assemble_energy(per_atom, net, dev.species, comp_view_, energy_scale_, pk.n_local);
   if (!grad) return {per_atom, {}, {}, {}};
 
@@ -159,12 +176,14 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     const ResidualSaves& s = ckpt ? one : sav[L];
     const bool kept_wide = keep_wide && !ckpt;
     auto efa = edge_adj[L], nfa = node_adj[L];
-    if (L + 1 < G)  // message passing: half of the next input's adjoint, via the reverse edge
+    if (L + 1 < G) {  // message passing: half of the next input's adjoint, from the reverse edge
+      const View2D partner = remote ? swap_rows(ie_adj, Net(0.5)) : View2D();
       Kokkos::parallel_for(
           "reb_msg", RangePolicy(0, E * D), KOKKOS_LAMBDA(int i) {
-            const int k = i / D, d = i % D;
-            if (rev(k) >= 0) efa(rev(k), d) += Net(0.5) * ie_adj(k, d);
+            const int k = i / D, d = i % D, r = rev(k);
+            efa(k, d) += r >= 0 ? Net(0.5) * ie_adj(r, d) : remote && ro(k) >= 0 ? partner(ro(k), d) : Net(0);
           });
+    }
     View2D tokens_adj = ws_.n2("re_tokens_adj", N * S, D);
     Kokkos::parallel_for(
         "reb_tok", RangePolicy(0, N * S * D), KOKKOS_LAMBDA(int i) {

@@ -35,7 +35,13 @@ def main():
     atoms = ase.Atoms(numbers=g["atomic_numbers"], positions=g["positions"],
                       cell=g["cell"], pbc=g["pbc"])
 
-    pet = load_model(args.ckpt).to(getattr(torch, args.dtype))
+    pet = load_model(args.ckpt)
+    # An uncertainty (LLPR) checkpoint wraps the energy model and keeps float32
+    # tensors of its own that .to() does not reach; the energy needs only the
+    # model inside.
+    if type(pet).__name__ == "LLPRUncertaintyModel":
+        pet = pet.model
+    pet = pet.to(getattr(torch, args.dtype))
     kw = {"variants": {"energy": args.variant}} if args.variant else {}
     calc = MetatomicCalculator(pet.export(), device="cpu", **kw)
     res = calc.compute_energy(atoms, compute_forces_and_stresses=True,

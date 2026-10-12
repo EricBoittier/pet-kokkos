@@ -33,7 +33,7 @@ Two model sources are supported:
   * a named upet model downloaded from HuggingFace (lab-cosmo/upet), the latest
     version or a given one:
       uv run tools/convert_pet.py --model pet-mad-xs --out models/pet-mad-xs
-      uv run tools/convert_pet.py --model pet-mols-s --version 1.0.0 --out models/pet-mols-s-v1.0
+      uv run tools/convert_pet.py --model pet-mols-s --version 1.1.0 --out models/pet-mols-s-v1.1
 
   * a local metatrain checkpoint (.ckpt), optionally selecting one of several
     energy *variants* trained on the same backbone (e.g. a model with both an

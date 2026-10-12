@@ -38,8 +38,9 @@ struct Options {
   bool cache_neighbors = false;
 
   // How the network's GEMMs run: Native, or a faster, less exact mode on tensor
-  // cores (TF32, BF16, FP16, FP8; see gemm.hpp). Native leaves PET_GEMM's
-  // choice. Process-global.
+  // cores (TF32, BF16, FP16, FP8; see gemm.hpp). Native leaves the default:
+  // PET_GEMM, else TF32 on NVIDIA from compute capability 8.0, else native fp32.
+  // Process-global.
   GemmMode gemm = GemmMode::Native;
 
   // The host neighbour search: vesin's cell list, or the built-in O(N^2) one.

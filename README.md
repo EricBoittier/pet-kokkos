@@ -123,10 +123,13 @@ then `./models`, `.`, `$XDG_DATA_HOME/pet/models` (or
   integer tensor cores (the Ozaki scheme).
 
 The network's matrix products can also run in lower precision on tensor cores,
-set with `PET_GEMM` (`tf32`, `fp16`, `bf16` or `fp8`) or `Options::gemm`. This
-is off by default. `tf32` and `fp16` are 10–20% faster on an RTX 4080 and
-change forces by about 1 meV/Å. `fp8` needs an Ada or Hopper GPU and is only
-good enough for screening. On AMD GPUs, only `bf16` and `fp16` are supported.
+set with `PET_GEMM` (`tf32`, `fp16`, `bf16` or `fp8`) or `Options::gemm`. On
+NVIDIA GPUs from compute capability 8.0 `tf32` is the default: 10-20% faster on
+an RTX 4080 and up to 2x on an H200, 0.1-0.25 meV/atom from fp32 and the same
+NVE energy drift; `PET_GEMM=native` turns it off. `fp16` is about as accurate;
+`bf16` is not (about 1 meV/atom, 4x the drift). `fp8` needs an Ada or Hopper GPU
+and is only good enough for screening. On AMD GPUs, only `bf16` and `fp16` are
+supported, and their fp32 already runs on the matrix cores.
 
 The virial is `W = V·σ`, a symmetric tensor in Voigt order
 `[xx, yy, zz, xy, xz, yz]`. Optimizers that work with strain gradients need
@@ -135,7 +138,10 @@ The virial is `W = V·σ`, a symmetric tensor in Voigt order
 ## Environment variables
 
 - `PET_MODEL_DIR`: extra directories to search for models.
-- `PET_GEMM`: `native`, `tf32`, `fp16`, `bf16`, `fp8` or `ozaki`.
+- `PET_GEMM`: `native`, `tf32`, `fp16`, `bf16`, `fp8` or `ozaki`. Unset, NVIDIA
+  GPUs from compute capability 8.0 (A100, H100/H200, RTX 30xx/40xx) use `tf32`
+  (0.1-0.25 meV/atom from fp32, up to 2x faster) and everything else `native`;
+  `PET_GEMM=native` keeps plain fp32 everywhere.
 - `PET_CUTLASS=0`: use plain cuBLAS instead of the CUTLASS kernels.
 - `PET_GRAPHS=0`: don't use CUDA/HIP graphs (useful when profiling).
 - `PET_RECOMPUTE`: `never`, `wide` or `layers` forces how much of the forward

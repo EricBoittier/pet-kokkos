@@ -17,6 +17,16 @@
 
 namespace pet {
 
+// The memory decision of the latest evaluation: its shapes, the recompute tier
+// taken, and what recompute_tier estimated that tier needs against the budget
+// (0: unlimited). Featurizers that never recompute leave the estimate at 0.
+struct MemoryPlan {
+  int atoms = 0, max_neighbors = 0;
+  long edges = 0;
+  Recompute tier = Recompute::Never;
+  std::size_t estimate = 0, budget = 0;
+};
+
 struct EnergyResult {
   double total = 0.0;
   std::vector<double> per_atom;  // [N] eV
@@ -236,6 +246,10 @@ class PetModel {
     return ws_.capacity_breakdown();
   }
   long peak_edge_slots() const { return peak_edge_slots_; }
+  const MemoryPlan& memory_plan() const { return plan_; }
+  // The plan, the pool and its largest buffers, and the device's free and total
+  // memory, as lines of text: what an out-of-memory error carries.
+  std::string memory_report() const;
   // Device bytes per edge slot with every save kept, from the shapes (as
   // recompute_tier estimates them), for sizing a batch before any is measured.
   std::size_t bytes_per_slot() const;
@@ -303,6 +317,10 @@ class PetModel {
 
   long peak_edge_slots_ = 0;
   int peak_max_neighbors_ = 0;
+  mutable MemoryPlan plan_;
+  // Under Recompute::Auto, the cheapest tier allowed: raised when a pass runs
+  // out of memory, so the evaluations after it do not try the same again.
+  Recompute tier_floor_ = Recompute::Never;
 };
 
 }  // namespace pet

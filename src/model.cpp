@@ -6,6 +6,9 @@
 #include "pet/ozaki.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <new>
 #include <stdexcept>
 
 namespace pet {
@@ -600,7 +603,6 @@ BatchResult PetModel::energy_forces_batch(const DeviceEdgeData& dev, bool comput
 }
 
 Recompute PetModel::recompute_tier(int N, int S, int E) const {
-  if (recompute_ != Recompute::Auto) return recompute_;
   // Estimated from the shapes: what one layer saves, how much of that is the two
   // widest activations (qkv and the edge MLP's pre-activation), and the working
   // set every tier needs.
@@ -609,8 +611,52 @@ Recompute PetModel::recompute_tier(int N, int S, int E) const {
   const std::size_t layer = sizeof(Net) * (A * (NS * 5 * D + NE * (ew + D)) + NE * 5 * D);
   const std::size_t wide = sizeof(Net) * A * (NS * 3 * D + NE * ew);
   const std::size_t work = sizeof(Net) * NE * (2 * ew + 6 * D + 4 * Dh);
-  auto fits = [&](std::size_t b) { return mem_budget_ == 0 || work + b <= mem_budget_; };
-  return fits(G * layer) ? Recompute::Never : fits(G * (layer - wide)) ? Recompute::Wide : Recompute::Layers;
+  // Layers keeps each layer's inputs and one layer's saves at a time. The pool
+  // comes out a quarter to a third above these terms (readout saves, packing,
+  // the tmp pool's slack; measured on pet-mad-xs and -s), so they are scaled to
+  // predict it.
+  const std::size_t inputs = sizeof(Net) * G * (std::size_t(N) * h_.d_node + NE * D);
+  auto need = [&](Recompute r) {
+    const std::size_t terms =
+        work + (r == Recompute::Never ? G * layer : r == Recompute::Wide ? G * (layer - wide) : inputs + layer);
+    return terms + terms / 3;
+  };
+  auto fits = [&](Recompute r) { return mem_budget_ == 0 || need(r) <= mem_budget_; };
+  const Recompute r = recompute_ != Recompute::Auto                    ? recompute_
+                      : fits(Recompute::Never) && tier_floor_ == Recompute::Never ? Recompute::Never
+                      : fits(Recompute::Wide) && tier_floor_ != Recompute::Layers ? Recompute::Wide
+                                                                                  : Recompute::Layers;
+  plan_.tier = r, plan_.estimate = need(r);
+  return r;
+}
+
+std::string PetModel::memory_report() const {
+  constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+  char line[256];
+  std::string r;
+  const MemoryPlan& p = plan_;
+  std::snprintf(line, sizeof line, "  %d atoms, %d neighbours at most, %ld edges; recompute %s", p.atoms,
+                p.max_neighbors, p.edges, recompute_name(p.tier));
+  r += line;
+  if (p.estimate) {
+    std::snprintf(line, sizeof line, " (estimated %.2f GiB", p.estimate / GiB);
+    r += line;
+    if (p.budget) std::snprintf(line, sizeof line, " of a %.2f GiB budget)", p.budget / GiB), r += line;
+    else r += ")";
+  }
+  const auto bufs = ws_.capacity_breakdown();
+  std::snprintf(line, sizeof line, "\n  scratch pool %.2f GiB, largest:", ws_.capacity_bytes() / GiB);
+  r += line;
+  for (std::size_t i = 0; i < bufs.size() && i < 4; ++i)
+    std::snprintf(line, sizeof line, " %s %.2f", bufs[i].first.c_str(), bufs[i].second / GiB), r += line;
+  std::size_t free_b = 0, total_b = 0;
+#if defined(KOKKOS_ENABLE_CUDA)
+  if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) free_b = total_b = 0;
+#elif defined(KOKKOS_ENABLE_HIP)
+  if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) free_b = total_b = 0;
+#endif
+  if (total_b) std::snprintf(line, sizeof line, "\n  device %.2f GiB free of %.2f GiB", free_b / GiB, total_b / GiB), r += line;
+  return r + "\n";
 }
 
 std::size_t PetModel::bytes_per_slot() const {
@@ -640,7 +686,30 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
     return h_.featurizer_type == FeaturizerType::Residual ? residual_pass(d, grad) : ff_pass(d, grad);
   };
   // A graph cannot hold the exchange's calls to the engine.
-  const DeviceOut out = graphs_ && !ozaki_active() && !d.exchange ? graph_.run(graph_key(d, grad), pass) : pass();
+  DeviceOut out;
+  // The shapes now; the tier and estimate stay those of the pass that recorded a
+  // replayed graph, or are 0 for a featurizer that never recomputes.
+  plan_.atoms = N, plan_.max_neighbors = d.max_neighbors, plan_.edges = d.n_edges, plan_.budget = mem_budget_;
+  for (;;) {
+    try {
+      out = graphs_ && !ozaki_active() && !d.exchange ? graph_.run(graph_key(d, grad), pass) : pass();
+      break;
+    } catch (const std::exception& e) {
+      // Kokkos 5 throws a bad_alloc, Kokkos 4 a runtime_error that says so.
+      const bool oom = dynamic_cast<const std::bad_alloc*>(&e) || std::strstr(e.what(), "failed to allocate");
+      if (!oom) throw;
+      // The estimate was wrong for this device: under Auto, give the pool back
+      // and run again a tier further down, from now on.
+      if (recompute_ == Recompute::Auto && h_.featurizer_type != FeaturizerType::Residual &&
+          plan_.tier != Recompute::Layers) {
+        tier_floor_ = plan_.tier == Recompute::Never ? Recompute::Wide : Recompute::Layers;
+        ws_.release();
+        continue;
+      }
+      throw std::runtime_error(std::string("out of device memory: ") + e.what() + "\n" + memory_report() +
+                               "Fewer atoms per device (more ranks or GPUs) would fit.");
+    }
+  }
 
   EnergyResult res;
   if (dev_per_atom) *dev_per_atom = out.per_atom;

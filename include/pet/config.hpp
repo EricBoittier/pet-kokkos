@@ -20,6 +20,10 @@ enum class AdaptiveCutoffMethod { Grid, Solver };
 // pre-activation), one norm and GEMM each; Layers, each GNN layer re-run from
 // its inputs (about one more forward). Auto takes the first that fits memory.
 enum class Recompute { Auto, Never, Wide, Layers };
+inline const char* recompute_name(Recompute r) {
+  const char* names[] = {"auto", "never", "wide", "layers"};
+  return names[int(r)];
+}
 
 struct Hypers {
   int d_pet = 128;          // edge / transformer width

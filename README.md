@@ -138,6 +138,10 @@ The virial is `W = V·σ`, a symmetric tensor in Voigt order
 - `PET_GEMM`: `native`, `tf32`, `fp16`, `bf16`, `fp8` or `ozaki`.
 - `PET_CUTLASS=0`: use plain cuBLAS instead of the CUTLASS kernels.
 - `PET_GRAPHS=0`: don't use CUDA/HIP graphs (useful when profiling).
+- `PET_RECOMPUTE`: `never`, `wide` or `layers` forces how much of the forward
+  the backward recomputes; by default the cheapest tier whose estimate fits the
+  device (less a reserve of 10% or 1.5 GiB) is taken, and a pass that runs out
+  of memory anyway is rerun a tier lower. `pet-eval --memory` shows the choice.
 - `PET_DEVICE_SEARCH`: `auto`, `cells` or `brute`, for the GPU neighbour search.
 - `PET_NEIGHBORS=builtin`: use the built-in host neighbour search instead of
   vesin.

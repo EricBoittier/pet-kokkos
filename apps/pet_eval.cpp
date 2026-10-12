@@ -383,6 +383,7 @@ int run(const Args& a) {
                 1e3 * best_seconds / std::max(1, total_atoms));
 
   if (a.report_memory) {
+    std::printf("\nmemory plan of the last evaluation:\n%s", calc.memory_report().c_str());
     const std::size_t pool = calc.workspace_bytes();
     std::printf("\ndevice scratch pool: %.2f GiB\n", double(pool) / (1024.0 * 1024.0 * 1024.0));
     // Grouped by label with the numbers collapsed ("ck_node_*"), so one buffer

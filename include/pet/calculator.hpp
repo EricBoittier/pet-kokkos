@@ -210,6 +210,10 @@ class Calculator {
   // Device scratch held, and what holds it.
   std::size_t workspace_bytes() const;
   std::vector<std::pair<std::string, std::size_t>> workspace_breakdown() const;
+  // The latest evaluation's memory decision (shapes, recompute tier, estimate
+  // against budget), and the same with the pool and device memory as text.
+  MemoryPlan memory_plan() const;
+  std::string memory_report() const;
 
   Options& options();
   const Options& options() const;

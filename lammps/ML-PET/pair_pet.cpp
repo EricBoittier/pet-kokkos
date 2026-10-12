@@ -54,6 +54,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -105,6 +106,27 @@ PairPET::~PairPET()
 
 /* ---------------------------------------------------------------------- */
 
+void PairPET::log_memory_plan()
+{
+  const pet::MemoryPlan p = calc->memory_plan();
+  if (int(p.tier) == logged_tier) return;
+  logged_tier = int(p.tier);
+  if (comm->me != 0) return;
+  constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+  std::string m = fmt::format("pair_style {}: rank 0, {} atoms, {} edges: recompute {}", force->pair_style, p.atoms,
+                              p.edges, pet::recompute_name(p.tier));
+  if (p.estimate) m += fmt::format(" (estimated {:.2f} GiB", p.estimate / GiB) +
+                       (p.budget ? fmt::format(" of a {:.2f} GiB budget)", p.budget / GiB) : std::string(")"));
+  utils::logmesg(lmp, m + "\n");
+}
+
+void PairPET::pet_error(const char *file, int line, const std::exception &e)
+{
+  if (!screen)
+    std::fputs(fmt::format("ERROR on proc {}: pair_style {}: {}\n", comm->me, force->pair_style, e.what()).c_str(), stderr);
+  error->one(file, line, "pair_style {}: {}", force->pair_style, e.what());
+}
+
 void PairPET::compute(int eflag, int vflag)
 {
   ev_init(eflag, vflag);
@@ -131,8 +153,9 @@ void PairPET::compute(int eflag, int vflag)
   try {
     r = calc->compute_step(n ? &x[0][0] : nullptr, cell, forces, forces && vflag_atom);
   } catch (std::exception &e) {
-    error->one(FLERR, "pair_style pet: {}", e.what());
+    pet_error(FLERR, e);
   }
+  log_memory_plan();
 
   if (eflag_global) eng_vdwl += r.energy[0];
   if (eflag_atom)
@@ -573,7 +596,7 @@ void PairPET::set(int n, bool half)
   try {
     calc->set_neighbors(v);
   } catch (std::exception &e) {
-    error->one(FLERR, "pair_style pet: {}", e.what());
+    pet_error(FLERR, e);
   }
 }
 

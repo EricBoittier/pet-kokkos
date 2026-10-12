@@ -108,7 +108,7 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::rebuild()
   try {
     calc->set_neighbors(v);
   } catch (std::exception &e) {
-    error->one(FLERR, "pair_style pet/kk: {}", e.what());
+    pet_error(FLERR, e);
   }
   listed = true;
 }
@@ -379,8 +379,9 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::compute(int eflag_in
   try {
     t = calc->compute_step(a, cell);
   } catch (std::exception &e) {
-    error->one(FLERR, "pair_style pet/kk: {}", e.what());
+    pet_error(FLERR, e);
   }
+  log_memory_plan();
 
   if (eflag_global) eng_vdwl += t.energy;
   if (vflag_global && a.forces)

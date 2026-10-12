@@ -136,6 +136,13 @@ class Workspace {
 
   void set_zero(bool z) { zero_ = z; }
 
+  // Free every buffer, none being held: after an allocation failed, what was
+  // kept for the larger shapes goes, and every view handed out is stale.
+  void release() {
+    named_.clear(), cur2_.clear(), tmp_.clear(), busy_.clear(), held_.clear();
+    ++generation_;
+  }
+
   // Bumped whenever the pool allocates, i.e. whenever a pointer it handed out
   // may have moved. A recorded CUDA graph keys on it.
   std::size_t generation() const { return generation_; }

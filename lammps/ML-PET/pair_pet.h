@@ -65,6 +65,11 @@ class PairPET : public Pair {
   std::vector<int> off, nbr, z, shift;   // the list at the last rebuild, pet-kokkos's form
   bool listed = false;
   bool full_list = false;                // images mode on a full list (pet/kk)
+  // Rank 0 logs the memory plan when its recompute tier changes; an error from
+  // pet-kokkos goes to stderr as well when this rank has no screen.
+  int logged_tier = -1;
+  void log_memory_plan();
+  void pet_error(const char *file, int line, const std::exception &e);
   // Whether MPI takes device pointers, so rows cross without host copies:
   // keyword gpu_aware yes|no, else asked of MPI (or, for pet/kk, LAMMPS's
   // -pk kokkos gpu/aware).

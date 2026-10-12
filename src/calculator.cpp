@@ -49,6 +49,11 @@ constexpr const char* kDefaultModel = "pet-mad-xs";
 // batch compute() is given is split only past what the card has.
 constexpr double kMemHeadroom = 0.8;
 constexpr double kMemCardFraction = 0.7;
+// The backward's saves may take the device less a reserve for what lives outside
+// the pool: the CUDA/HIP context, BLAS workspaces, the neighbour data, an
+// engine's own arrays.
+constexpr double kReserveFraction = 0.1;
+constexpr double kReserveMin = 1.5 * 1024 * 1024 * 1024;
 constexpr long kMaxEdgeSlots = 131072;
 constexpr long kMinSampleSlots = 4096;  // below this, fixed-size buffers dominate the sample
 
@@ -204,7 +209,13 @@ struct Calculator::Impl {
     // PET_GRAPHS=0 is for profilers that fence around every kernel.
     const char* g = std::getenv("PET_GRAPHS");
     model.set_graphs(o.graphs && !(g && g[0] == '0'));
-    model.set_memory_policy(std::size_t(double(total_b) * kMemCardFraction * kMemHeadroom), o.recompute);
+    // PET_RECOMPUTE=never|wide|layers|auto overrides the option, to compare tiers.
+    Recompute rc = o.recompute;
+    if (const char* r = std::getenv("PET_RECOMPUTE"))
+      for (Recompute t : {Recompute::Auto, Recompute::Never, Recompute::Wide, Recompute::Layers})
+        if (std::string(r) == recompute_name(t)) rc = t;
+    const double t = double(total_b);
+    model.set_memory_policy(std::size_t(std::max(t / 2, t - std::max(kReserveMin, kReserveFraction * t))), rc);
     // Process-global, as the two searches are meant to agree. PET_NEIGHBORS=builtin
     // overrides the option, to check one against the other without rebuilding.
     const char* nb = std::getenv("PET_NEIGHBORS");
@@ -562,6 +573,9 @@ std::size_t Calculator::workspace_bytes() const { return impl_->model.workspace_
 std::vector<std::pair<std::string, std::size_t>> Calculator::workspace_breakdown() const {
   return impl_->model.workspace_breakdown();
 }
+
+MemoryPlan Calculator::memory_plan() const { return impl_->model.memory_plan(); }
+std::string Calculator::memory_report() const { return impl_->model.memory_report(); }
 
 int Calculator::recommended_batch_atoms() const {
   if (impl_->opts.max_batch_atoms > 0) return impl_->opts.max_batch_atoms;

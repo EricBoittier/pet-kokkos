@@ -1,6 +1,7 @@
 // Dense GEMM: C = alpha op(A) op(B) + beta C (+ bias on every row), on
-// row-major Net views, through the vendor BLAS (cuBLAS, rocBLAS) or a naive
-// Kokkos loop on the host. The only linear algebra PET needs.
+// row-major Net views, through the vendor BLAS (cuBLAS, rocBLAS), a CBLAS on the
+// host (PET_HAVE_CBLAS), or else a naive Kokkos loop. The only linear algebra
+// PET needs.
 //
 // A row-major [r,c] matrix is the column-major [c,r] one, so each call computes
 // C^T = op(B)^T op(A)^T: B and A swap places, and so do m and n.
@@ -8,6 +9,7 @@
 
 #include "pet/kokkos.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -22,6 +24,8 @@
 #if defined(PET_HAVE_HIPBLASLT)
 #include <hipblaslt/hipblaslt.h>
 #endif
+#elif defined(PET_HAVE_CBLAS)
+#include <cblas.h>
 #endif
 
 namespace pet {
@@ -127,6 +131,19 @@ inline void vendor_gemm(rocblas_operation oa, rocblas_operation ob, int m, int n
                         const double* A, int lda, const double* B, int ldb, double be, double* C,
                         int ldc) {
   rocblas_dgemm(blas_handle(), oa, ob, m, n, k, &al, A, lda, B, ldb, &be, C, ldc);
+}
+#elif defined(PET_HAVE_CBLAS)
+// Row-major, as the views are. Called between Kokkos kernels, so a threaded BLAS
+// has the cores to itself (an OpenMP one shares Kokkos's thread pool).
+inline void vendor_gemm(CBLAS_TRANSPOSE oa, CBLAS_TRANSPOSE ob, int m, int n, int k, float al,
+                        const float* A, int lda, const float* B, int ldb, float be, float* C,
+                        int ldc) {
+  cblas_sgemm(CblasRowMajor, oa, ob, m, n, k, al, A, lda, B, ldb, be, C, ldc);
+}
+inline void vendor_gemm(CBLAS_TRANSPOSE oa, CBLAS_TRANSPOSE ob, int m, int n, int k, double al,
+                        const double* A, int lda, const double* B, int ldb, double be, double* C,
+                        int ldc) {
+  cblas_dgemm(CblasRowMajor, oa, ob, m, n, k, al, A, lda, B, ldb, be, C, ldc);
 }
 #endif
 
@@ -272,6 +289,23 @@ inline void gemm(char transA, char transB, Net alpha, const View2D& A, const Vie
               ta ? rocblas_operation_transpose : rocblas_operation_none, n, m, k, alpha, B.data(),
               ldb, A.data(), lda, beta, C.data(), ldc);
   if (has_bias) add_bias(C, bias);
+#elif defined(PET_HAVE_CBLAS)
+  if (m == 0 || n == 0) return;
+  // The rows' pitch, at least a row (BLAS insists, even for an empty or one-row
+  // matrix whose stride says less).
+  auto pitch = [](const View2D& V) { return int(std::max<std::size_t>({V.stride(0), V.extent(1), 1})); };
+  // The bias first, row by row, for the GEMM to add onto (beta = 1): one pass
+  // over C fewer. With a beta of its own, a bias pass after.
+  const bool bias_first = has_bias && beta == Net(0);
+  if (bias_first)
+    Kokkos::parallel_for(
+        "bias_rows", RangePolicy(0, m), KOKKOS_LAMBDA(int i) {
+          for (int j = 0; j < n; ++j) C(i, j) = bias(j);
+        });
+  ExecSpace().fence();  // A, B and C come from kernels that may still be running
+  vendor_gemm(ta ? CblasTrans : CblasNoTrans, tb ? CblasTrans : CblasNoTrans, m, n, k, alpha, A.data(),
+              pitch(A), B.data(), pitch(B), bias_first ? Net(1) : beta, C.data(), pitch(C));
+  if (has_bias && !bias_first) add_bias(C, bias);
 #else
   Kokkos::parallel_for(
       "gemm_naive", RangePolicy(0, m * n), KOKKOS_LAMBDA(int ij) {

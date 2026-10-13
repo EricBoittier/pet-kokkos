@@ -58,6 +58,7 @@ set_property(CACHE PET_WITH_CUTLASS PROPERTY STRINGS AUTO ON OFF)
 # can reuse an object on a CPU that cannot run it). Never for CUDA: nvcc does
 # not accept the flag.
 option(PET_ARCH_NATIVE "Optimize for the building machine's CPU (-march=native)" ON)
+option(PET_USE_BLAS "Host builds: the GEMMs through a CBLAS (OpenBLAS, MKL, ...) when one is found" ON)
 
 set(PET_BACKEND "serial" CACHE STRING "Kokkos backend: serial, openmp, cuda, hip")
 set_property(CACHE PET_BACKEND PROPERTY STRINGS serial openmp cuda hip)

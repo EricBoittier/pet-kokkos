@@ -85,6 +85,10 @@ CMake options:
   neighbour search (on if found).
 - `PET_ARCH_NATIVE`: build with `-march=native` (default on). Turn it off if you
   build on one machine and run on another.
+- `PET_USE_BLAS`: serial and OpenMP builds run their GEMMs through a CBLAS
+  (OpenBLAS, MKL, BLIS, ...) when one is found (default on). Without one they
+  fall back to a plain Kokkos loop, 12-20x slower on pet-mad. With OpenMP, an
+  OpenMP-threaded BLAS shares Kokkos's threads.
 - `PET_BUILD_TESTS`, `PET_BUILD_APPS`.
 
 When pet-kokkos is pulled in as a dependency (`add_subdirectory`, CPM or

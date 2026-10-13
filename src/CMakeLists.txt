@@ -81,7 +81,8 @@ endif()
 
 # --- dense GEMM --------------------------------------------------------------
 # The only BLAS PET needs. gemm.hpp routes it to the vendor library of the
-# active Kokkos backend; on host it uses a portable Kokkos fallback.
+# active Kokkos backend; on host to a CBLAS when there is one (PET_USE_BLAS),
+# else to a portable Kokkos loop, many times slower.
 if(PET_BACKEND STREQUAL "cuda")
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(pet_kokkos PUBLIC CUDA::cublas CUDA::cublasLt)
@@ -98,7 +99,28 @@ elseif(PET_BACKEND STREQUAL "hip")
     endif()
     message(STATUS "pet_kokkos: GEMM via rocBLAS")
 else()
-    message(STATUS "pet_kokkos: GEMM via portable Kokkos fallback (host)")
+    set(_pet_cblas FALSE)
+    if(PET_USE_BLAS)
+        # Any BLAS that also has the C interface: OpenBLAS, MKL, BLIS, ... --
+        # not the reference libblas, whose CBLAS is a separate library.
+        find_package(BLAS QUIET)
+        find_path(PET_CBLAS_INCLUDE_DIR cblas.h PATH_SUFFIXES openblas blis)
+        if(BLAS_FOUND AND PET_CBLAS_INCLUDE_DIR)
+            include(CheckFunctionExists)
+            set(CMAKE_REQUIRED_LIBRARIES ${BLAS_LIBRARIES})
+            check_function_exists(cblas_sgemm PET_BLAS_HAS_CBLAS)
+            unset(CMAKE_REQUIRED_LIBRARIES)
+            set(_pet_cblas ${PET_BLAS_HAS_CBLAS})
+        endif()
+    endif()
+    if(_pet_cblas)
+        target_link_libraries(pet_kokkos PUBLIC BLAS::BLAS)
+        target_include_directories(pet_kokkos PUBLIC $<BUILD_INTERFACE:${PET_CBLAS_INCLUDE_DIR}>)
+        target_compile_definitions(pet_kokkos PUBLIC PET_HAVE_CBLAS)
+        message(STATUS "pet_kokkos: GEMM via CBLAS (${BLAS_LIBRARIES})")
+    else()
+        message(STATUS "pet_kokkos: GEMM via portable Kokkos fallback (host; no CBLAS found, or PET_USE_BLAS=OFF)")
+    endif()
 endif()
 
 # In-tree model directory, the last entry in the runtime model search path.

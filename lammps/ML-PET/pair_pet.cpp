@@ -355,7 +355,9 @@ void PairPET::alltoall_rows(const char *out, int width, char *in)
   for (int p = 0; p < nprocs; ++p)
     sc[p] = send_counts[p] * width, sd[p] = send_displs[p] * width, rc[p] = recv_counts[p] * width,
     rd[p] = recv_displs[p] * width;
-  MPI_Alltoallv(out, sc.data(), sd.data(), MPI_BYTE, in, rc.data(), rd.data(), MPI_BYTE, world);
+  // const_cast: LAMMPS's serial MPI stubs take a non-const send buffer.
+  MPI_Alltoallv(const_cast<char *>(out), sc.data(), sd.data(), MPI_BYTE, in, rc.data(), rd.data(), MPI_BYTE,
+                world);
 }
 
 void PairPET::set_peers()
@@ -640,15 +642,21 @@ void PairPET::settings(int narg, char **arg)
   // each one is on, not by ranks per node over devices visible: a rank that sees
   // only its own GPU (HIP_VISIBLE_DEVICES per rank) would otherwise budget for an
   // eighth of it, and recompute what it could have kept.
-  MPI_Comm node;
-  MPI_Comm_split_type(world, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node);
   int node_ranks = 1;
-  MPI_Comm_size(node, &node_ranks);
   char mine[64] = {0};
   std::strncpy(mine, pet::device_identity().c_str(), sizeof(mine) - 1);
   std::vector<char> ids(64 * std::size_t(node_ranks));
+#ifdef MPI_STUBS
+  // A serial build (LAMMPS's MPI stubs): one rank, alone on its device.
+  std::memcpy(ids.data(), mine, 64);
+#else
+  MPI_Comm node;
+  MPI_Comm_split_type(world, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node);
+  MPI_Comm_size(node, &node_ranks);
+  ids.resize(64 * std::size_t(node_ranks));
   MPI_Allgather(mine, 64, MPI_CHAR, ids.data(), 64, MPI_CHAR, node);
   MPI_Comm_free(&node);
+#endif
   pet::Options opts;
   opts.device_share = 0;
   for (int r = 0; r < node_ranks; ++r) opts.device_share += std::strncmp(&ids[64 * std::size_t(r)], mine, 64) == 0;

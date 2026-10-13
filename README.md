@@ -93,9 +93,16 @@ FetchContent), the tests and apps are off by default and an existing
 
 ## Models
 
-Model weights are not included here, and shouldn't be added, because some
-checkpoints don't allow redistribution. Convert them yourself from a published
-upet model or a metatrain checkpoint:
+Every published upet model, already converted, is on Hugging Face at
+[peterspackman/pet-kokkos-models](https://huggingface.co/peterspackman/pet-kokkos-models):
+
+```bash
+hf download peterspackman/pet-kokkos-models --local-dir ~/.local/share/pet/models
+hf download peterspackman/pet-kokkos-models --include "pet-mad-s.*" --local-dir models
+```
+
+Model weights aren't kept in this repository. To convert a model yourself,
+from upet or a metatrain checkpoint:
 
 ```bash
 uv run tools/convert_pet.py --model pet-mad-xs --out models/pet-mad-xs

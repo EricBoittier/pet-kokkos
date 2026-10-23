@@ -197,6 +197,8 @@ struct ReadoutSaves {
   std::vector<View2D> nh0, nh1, eh0, eh1, epred;
 };
 
+struct TokenLayout;  // ops.hpp
+
 class PetModel {
  public:
   explicit PetModel(const Checkpoint& ckpt);
@@ -271,12 +273,15 @@ class PetModel {
   DeviceOut residual_pass(const DeviceEdgeData& dev, bool grad);  // residual.cpp
   // remote_in: the partners' rows for edges to ghosts, fetched when `share`,
   // else (a recompute) already there.
+  // tl: the tokens' layout for the ragged attention kernels (ops.hpp), or null
+  // for attention.cpp's over padded tokens; the bias adjoint goes to cf_adj
+  // [E] with tl, else to cf_seq_adj [N, S].
   void ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D& node,
                 View2D input_edge, View2D cond, LayerSaves* sav, bool save_wide, View2D remote_in = {},
-                bool share = false);
+                bool share = false, const TokenLayout* tl = nullptr);
   void ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, int L, const LayerSaves& sav,
                     bool kept_wide, View2D node_adj, View2D input_edge_adj, View2D x4_adj,
-                    View2D cf_seq_adj);
+                    View2D cf_seq_adj, View1D cf_adj = {}, const TokenLayout* tl = nullptr);
   // One residual GNN layer from input_edge to its read-out features; sav null
   // saves nothing, save_wide keeps qkv and the MLP pre-activation.
   void residual_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D input_edge,
@@ -293,7 +298,7 @@ class PetModel {
 
   // The pieces the two featurizers share but configure differently (which norm,
   // which activation), dispatched on the hypers.
-  void norm(View2D out, View2D in, const std::string& key, View2D add = {}) const;
+  void norm(View2D out, View2D in, const std::string& key, View2D add = {}, View2D copy = {}) const;
   void norm_bwd(View2D in_adj, View2D out_adj, View2D in, const std::string& key, bool acc = true,
                 View2D also = {}) const;
   // out = w_out(act(w_in(in))) onto beta * out; `pre` receives w_in(in), [R,

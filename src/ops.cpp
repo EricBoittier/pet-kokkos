@@ -105,15 +105,19 @@ KOKKOS_INLINE_FUNCTION void row_stats(const Team& t, const View2D& x, int r, boo
   inv = norm_inv(v, D, ln);
 }
 
-void norm_fwd(View2D out, View2D in, View1D weight, View1D bias, View2D add) {
-  const bool ln = bias.extent(0) > 0, sum = add.data() != nullptr;
+void norm_fwd(View2D out, View2D in, View1D weight, View1D bias, View2D add, View2D copy) {
+  const bool ln = bias.extent(0) > 0, sum = add.data() != nullptr, twice = copy.data() != nullptr;
   const int N = in.extent(0);
   Kokkos::parallel_for(
       "norm", norm_policy(N), KOKKOS_LAMBDA(const Team& t) {
         const int r = t.league_rank() * kNormRows + t.team_rank();
         if (r >= N) return;
         // Each lane rereads only what it wrote, so the passes need no barrier.
-        if (sum) Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, in.extent(1)), [&](int d) { in(r, d) += add(r, d); });
+        if (sum)
+          Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, in.extent(1)), [&](int d) {
+            in(r, d) += add(r, d);
+            if (twice) copy(r, d) = in(r, d);
+          });
         Net mu, inv;
         row_stats(t, in, r, ln, mu, inv);
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, in.extent(1)), [&](int d) {

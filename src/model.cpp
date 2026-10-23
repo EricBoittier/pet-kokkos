@@ -468,9 +468,9 @@ View2D PetModel::conditioning(const DeviceEdgeData& dev) {
   return out;
 }
 
-void PetModel::norm(View2D out, View2D in, const std::string& key, View2D add) const {
+void PetModel::norm(View2D out, View2D in, const std::string& key, View2D add, View2D copy) const {
   const bool ln = h_.normalization == Normalization::LayerNorm;
-  norm_fwd(out, in, vec(key + ".weight"), ln ? vec(key + ".bias") : View1D(), add);
+  norm_fwd(out, in, vec(key + ".weight"), ln ? vec(key + ".bias") : View1D(), add, copy);
 }
 
 void PetModel::norm_bwd(View2D in_adj, View2D out_adj, View2D in, const std::string& key, bool acc,

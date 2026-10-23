@@ -36,9 +36,10 @@ void gather(View2D out, View2D table, IView1D idx);
 void copy(View2D a, View2D b);
 
 // RMSNorm, or LayerNorm when `bias` is non-empty (see ops.cpp).
-// add, unless empty, is first added into in (a residual sum the norm reads);
-// also, unless empty, receives a second copy of in_adj.
-void norm_fwd(View2D out, View2D in, View1D weight, View1D bias, View2D add = {});
+// add, unless empty, is first added into in (a residual sum the norm reads), and
+// copy, unless empty, receives that sum too; also, unless empty, receives a
+// second copy of in_adj.
+void norm_fwd(View2D out, View2D in, View1D weight, View1D bias, View2D add = {}, View2D copy = {});
 void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool layernorm, bool acc, View2D also = {});
 
 // out = w_out(v * sigmoid(g)) onto beta * out, where pre = w_in(in) holds v and
@@ -89,6 +90,33 @@ void attention_bwd(Workspace& ws, const std::string& key, View2D in_adj, View2D 
                    const WeightRef& w_out, int N, int S, int heads, int head_dim,
                    double temperature, Net beta);
 
+// ---- attention_ragged.cpp --------------------------------------------------
+//
+// The same attention over ragged sequences -- each atom's central token and its
+// kept edges, no padding -- on CUDA in an fp32 network (mlip.cpp's kernels).
+// Atom n's token t is row
+//   S0 = 0 (packed): n for t = 0, else N + off(n) + t - 1   (T = N + E rows)
+//   S0 = S (padded): n S + t                                  (T = N S rows)
+// and key t > 0 carries the bias lcf(off(n) + t - 1) (attention_log_cf).
+struct TokenLayout {
+  int N = 0, E = 0, S0 = 0, T = 0;
+  int max_len = 1;  // the longest sequence, 1 + the most kept edges of an atom
+  bool tail = false;  // rows [N + off(N), T) belong to no atom (an edge capacity)
+  IView1D off, center;
+  View1D lcf, cut;
+};
+// Whether the ragged kernels run here for this head count and size (CUDA, fp32
+// network, head size 8, 16, 32 or 64; PET_ATTN=kokkos turns them off).
+bool attention_ragged_supported(int heads, int head_dim);
+// log(cf) per packed edge, -inf for cf <= 0.
+View1D attention_log_cf(Workspace& ws, const PackedEdges& pk);
+// As attention / attention_bwd, the cf adjoint per packed edge (accumulated).
+void attention_ragged(Workspace& ws, const std::string& key, View2D out, View2D qkv, const TokenLayout& tl,
+                      const WeightRef& w_out, View1D b_out, int heads, int head_dim, double temperature, bool save);
+void attention_ragged_bwd(Workspace& ws, const std::string& key, View2D in_adj, View1D cf_adj, View2D out_adj,
+                          View2D qkv, const TokenLayout& tl, const WeightRef& w_in, const WeightRef& w_out,
+                          int heads, int head_dim, double temperature, Net beta);
+
 // ---- forces.cpp -------------------------------------------------------------
 
 // soff(b) = the first atom of structure b, soff(NS) = N. A structure's atoms are
@@ -99,12 +127,14 @@ void sum_by_structure(RView2D x, IView1D soff, RView2D out, bool acc);
 
 // Forces and virial from the adjoints the network leaves on each edge: x4_adj
 // ([E, 4], of (v, |v|)), cutoff_adj ([E], of the readout's cutoff factor) and
-// cf_seq_adj ([N, S], of the attention bias). Adds the adaptive cutoff's share
+// cf_seq_adj ([N, S], of the attention bias; or, when empty, cf_edge_adj [E],
+// the same per packed edge, from the ragged attention). Adds the adaptive cutoff's share
 // when the model has one. Returns forces [N, 3] and the per-structure virial
 // [n_struct, 9], both scaled by `scale`, and -- when dev has raw_slot -- dE/dv for
 // every raw edge [n_raw, 3], which the forces and virial are a fold of.
 void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdges& pk,
                        const Hypers& h, RView1D probes, int n_probes, double scale, View2D x4_adj,
-                       View1D cutoff_adj, View2D cf_seq_adj, RView2D& forces, RView2D& vir9, RView2D& edge_grad);
+                       View1D cutoff_adj, View2D cf_seq_adj, RView2D& forces, RView2D& vir9, RView2D& edge_grad,
+                       View1D cf_edge_adj = {});
 
 }  // namespace pet

@@ -328,7 +328,7 @@ void adaptive_part(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h, RV
 void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdges& pk,
                        const Hypers& h, RView1D probes, int n_probes, double scale, View2D x4_adj,
                        View1D cutoff_adj, View2D cf_seq_adj, RView2D& forces, RView2D& vir9,
-                       RView2D& edge_grad) {
+                       RView2D& edge_grad, View1D cf_edge_adj) {
   const int N = dev.n_atoms, E = pk.E;
   const bool adaptive = h.adaptive(), bump = h.cutoff_function == CutoffFunction::Bump;
   const double width = h.cutoff_width;
@@ -343,6 +343,7 @@ void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdg
   auto vec = pk.vec;
   auto dist = pk.dist, pcut = pk.pcut;
   const int nc = pk.off.extent(0) - 1;
+  const bool per_edge = cf_seq_adj.extent(0) == 0;
   Kokkos::parallel_for(
       "edge_grad", RangePolicy(0, E), KOKKOS_LAMBDA(int k) {
         if (k >= off(nc)) {  // a capacity's dead row
@@ -351,7 +352,7 @@ void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdg
           return;
         }
         const int n = center(k), m = k - off(n);
-        const double cutoff_total = cutoff_adj(k) + cf_seq_adj(n, 1 + m);
+        const double cutoff_total = cutoff_adj(k) + (per_edge ? cf_edge_adj(k) : cf_seq_adj(n, 1 + m));
         const double dcut_dd = cutoff_ddist(dist(k), pcut(k), width, bump);
         const double dist_adj = x4_adj(k, 3) + cutoff_total * dcut_dd;
         const double invd = (dist(k) > 0.0) ? 1.0 / dist(k) : 0.0;

@@ -3,6 +3,7 @@
 # written against each other, and apart they drift.
 #   ops.cpp          dense layers, norms, SwiGLU, compress.0, energy assembly
 #   attention.cpp    attention
+#   attention_ragged.cpp  attention over ragged (unpadded) sequences, CUDA
 #   feedforward.cpp  the feedforward featurizer
 #   residual.cpp     the residual featurizer
 #   forces.cpp       edge gradients -> forces and virial, adaptive cutoff
@@ -25,6 +26,7 @@ add_library(pet_kokkos STATIC
     neighbors.cpp
     device_neighbors.cpp
     attention.cpp
+    attention_ragged.cpp
     feedforward.cpp
     residual.cpp
     forces.cpp
